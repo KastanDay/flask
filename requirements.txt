@@ -20,7 +20,7 @@ typing_extensions==4.8.0
 cryptography==42.0.7
 
 # Utils
-tiktoken==0.5.1
+tiktoken
 python-dotenv==1.0.1
 pydantic==2.8.2 # updated to resolve nomic errors
 flask-executor==1.0.0
@@ -29,8 +29,8 @@ XlsxWriter==3.2.0
 
 # AI & core services
 nomic==3.3.0
-openai==0.28.1
-langchain==0.0.331
+openai
+langchain
 langchainhub==0.1.14
 
 # Data
@@ -45,6 +45,16 @@ posthog==3.1.0
 sentry-sdk==1.39.1
 
 ollama==0.2.1
+
+
+# Cedar bluff packages
+langchain-openai 
+trustcall
+langsmith 
+langchain-core
+langchain-community
+langgraph==0.1.2
+
 
 # Not currently supporting coursera ingest
 # cs-dlp @ git+https://github.com/raffaem/cs-dlp.git@0.12.0b0 # previously called coursera-dl
