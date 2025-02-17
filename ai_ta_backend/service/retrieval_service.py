@@ -195,6 +195,22 @@ class RetrievalService:
 
     return distinct_dicts
 
+  def llm_monitor_message(self, messages: List[str], course_name: str) -> List[Dict]:
+    """
+    Will store categories in DB, send email if an alert is triggered.
+    """
+    from ai_ta_backend.utils.email.send_transactional_email import send_email
+
+    # TODO: do your categorization
+
+    send_email(subject="LLM Monitor Alert",
+               body_text="An alert has been triggered",
+               sender="hi@uiuc.chat",
+               receipients=["kvday2@illinois.edu", "Heather's email here "],
+               bcc_receipients=[])
+
+    raise NotImplementedError("Method deprecated for performance reasons. Hope to bring back soon.")
+
   def delete_data(self, course_name: str, s3_path: str, source_url: str):
     """Delete file from S3, Qdrant, and Supabase."""
     print(f"Deleting data for course {course_name}")
@@ -393,10 +409,15 @@ class RetrievalService:
     # Perform the vector search
     start_time_vector_search = time.monotonic()
 
-    # SPECIAL CASE FOR VYRIAD
+    # ----------------------------
+    # SPECIAL CASE FOR VYRIAD, CROPWIZARD
+    # ----------------------------
     if course_name == "vyriad":
       search_results = self.vdb.vyriad_vector_search(search_query, course_name, doc_groups, user_query_embedding, top_n,
                                                      disabled_doc_groups, public_doc_groups)
+    elif course_name == "cropwizard":
+      search_results = self.vdb.cropwizard_vector_search(search_query, course_name, doc_groups, user_query_embedding,
+                                                         top_n, disabled_doc_groups, public_doc_groups)
     else:
       search_results = self.vdb.vector_search(search_query, course_name, doc_groups, user_query_embedding, top_n,
                                               disabled_doc_groups, public_doc_groups)

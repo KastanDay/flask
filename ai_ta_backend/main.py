@@ -43,6 +43,7 @@ from ai_ta_backend.service.sentry_service import SentryService
 from ai_ta_backend.service.workflow_service import WorkflowService
 from ai_ta_backend.utils.email.send_transactional_email import send_email
 from ai_ta_backend.utils.pubmed_extraction import extractPubmedData
+from ai_ta_backend.utils.update_project import webscrape_documents
 
 app = Flask(__name__)
 CORS(app)
@@ -126,6 +127,32 @@ def getTopContexts(service: RetrievalService) -> Response:
   response = jsonify(found_documents)
   response.headers.add('Access-Control-Allow-Origin', '*')
   print(f"⏰ Runtime of getTopContexts in main.py: {(time.monotonic() - start_time):.2f} seconds")
+  return response
+
+
+@app.route('/llm-monitor-message', methods=['POST'])
+def llm_monitor_message(service: RetrievalService) -> Response:
+  """Get most relevant contexts for a given search query.
+  
+  """
+  start_time = time.monotonic()
+  data = request.get_json()
+  messages: List[str] = data.get('messages', [])
+  course_name: str = data.get('course_name', '')
+
+  if course_name == '' or messages == []:
+    # proper web error "400 Bad request"
+    abort(
+        400,
+        description=
+        f"Missing one or more required parameters: 'course_name' and 'messages' must be provided. Course name: `{course_name}`"
+    )
+
+  found_documents = service.llm_monitor_message(messages, course_name)
+  response = jsonify(found_documents)
+  response.headers.add('Access-Control-Allow-Origin', '*')
+  print(f"⏰ Runtime of getTopContexts in main.py: {(time.monotonic() - start_time):.2f} seconds")
+
   return response
 
 
@@ -687,6 +714,19 @@ def send_transactional_email(service: ExportService):
     response = Response(status=500)
     response.data = f"An unexpected error occurred: {e}".encode()
 
+  response.headers.add('Access-Control-Allow-Origin', '*')
+  return response
+
+@app.route('/updateProjectDocuments', methods=['GET'])
+def updateProjectDocuments() -> Response:
+  project_name = request.args.get('project_name', default='', type=str)
+
+  if project_name == '':
+      abort(400, description="Missing required parameter: 'project_name' must be provided.")
+
+  result = webscrape_documents(project_name)
+
+  response = jsonify(result)
   response.headers.add('Access-Control-Allow-Origin', '*')
   return response
 

@@ -6,8 +6,8 @@ Use CAII gmail to auth.
 from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 import beam
+from beam import BotContext  # To obtain task_id
 from beam import QueueDepthAutoscaler  # RequestLatencyAutoscaler,
-from beam import BotContext  # To obtain task_id 
 
 if beam.env.is_remote():
   # Only import these in the Cloud container, not when building the container.
@@ -117,6 +117,8 @@ ourSecrets = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "POSTHOG_API_KEY",
+    "CROPWIZARD_QDRANT_URL",
+    "CROPWIZARD_QDRANT_API_KEY",
     # "AZURE_OPENAI_KEY",
     # "AZURE_OPENAI_ENGINE",
     # "AZURE_OPENAI_KEY",
@@ -133,6 +135,13 @@ def loader():
   # vector DB
   qdrant_client = QdrantClient(
       url=os.getenv('QDRANT_URL'),
+      api_key=os.getenv('QDRANT_API_KEY'),
+  )
+
+  cropwizard_qdrant_client = QdrantClient(
+      url=os.getenv('CROPWIZARD_QDRANT_URL'),
+      port=443,
+      https=True,
       api_key=os.getenv('QDRANT_API_KEY'),
   )
 
@@ -166,170 +175,177 @@ def loader():
 
   posthog = Posthog(sync_mode=True, project_api_key=os.environ['POSTHOG_API_KEY'], host='https://app.posthog.com')
 
-  return qdrant_client, vectorstore, s3_client, supabase_client, posthog
+  return qdrant_client, cropwizard_qdrant_client, vectorstore, s3_client, supabase_client, posthog
 
 
 # Triggers determine how your app is deployed
 # @app.rest_api(
-@beam.task_queue(name='ingest_task_queue',
-                 workers=4,
-                 cpu=1,
-                 memory=3_072,
-                 max_pending_tasks=15_000,
-                # DEPRICATED, not needed -- callback_url='https://uiuc.chat/api/UIUC-api/ingestTaskCallback',
-                 timeout=60 * 25,
-                 retries=1,
-                 secrets=ourSecrets,
-                 on_start=loader,
-                 image=image,
-                 autoscaler=autoscaler)
-
+@beam.task_queue(
+    name='ingest_task_queue',
+    workers=4,
+    cpu=1,
+    memory=3_072,
+    max_pending_tasks=15_000,
+    # DEPRICATED, not needed -- callback_url='https://uiuc.chat/api/UIUC-api/ingestTaskCallback',
+    timeout=60 * 25,
+    retries=1,
+    secrets=ourSecrets,
+    on_start=loader,
+    image=image,
+    autoscaler=autoscaler)
 def ingest(context, **inputs: Dict[str | List[str], Any]):
-    qdrant_client, vectorstore, s3_client, supabase_client, posthog = context.on_start_value
-    course_name: List[str] | str = inputs.get('course_name', '')
-    s3_paths: List[str] | str = inputs.get('s3_paths', '')
-    url: List[str] | str | None = inputs.get('url', None)
-    base_url: List[str] | str | None = inputs.get('base_url', None)
-    readable_filename: List[str] | str = inputs.get('readable_filename', '')
-    content: str | List[str] | None = inputs.get('content', None)
-    doc_groups: List[str] | str = inputs.get('groups', [])
+  qdrant_client, cropwizard_qdrant_client, vectorstore, s3_client, supabase_client, posthog = context.on_start_value
+  course_name: List[str] | str = inputs.get('course_name', '')
+  s3_paths: List[str] | str = inputs.get('s3_paths', '')
+  url: List[str] | str | None = inputs.get('url', None)
+  base_url: List[str] | str | None = inputs.get('base_url', None)
+  readable_filename: List[str] | str = inputs.get('readable_filename', '')
+  content: str | List[str] | None = inputs.get('content', None)
+  doc_groups: List[str] | str = inputs.get('groups', [])
 
-    print(f"In top of /ingest route. course: {course_name}, s3paths: {s3_paths}, readable_filename: {readable_filename}, base_url: {base_url}, url: {url}, content: {content}, doc_groups: {doc_groups}")
+  print(
+      f"In top of /ingest route. course: {course_name}, s3paths: {s3_paths}, readable_filename: {readable_filename}, base_url: {base_url}, url: {url}, content: {content}, doc_groups: {doc_groups}"
+  )
 
-    ingester = Ingest(qdrant_client, vectorstore, s3_client, supabase_client, posthog)
+  ingester = Ingest(qdrant_client, cropwizard_qdrant_client, vectorstore, s3_client, supabase_client, posthog)
 
-    def run_ingest(course_name, s3_paths, base_url, url, readable_filename, content, groups):
-        if content:
-            return ingester.ingest_single_web_text(course_name, base_url, url, content, readable_filename, groups=groups)
-        elif readable_filename == '':
-            return ingester.bulk_ingest(course_name, s3_paths, base_url=base_url, url=url, groups=groups)
-        else:
-            return ingester.bulk_ingest(course_name, s3_paths, readable_filename=readable_filename, base_url=base_url, url=url, groups=groups)
+  def run_ingest(course_name, s3_paths, base_url, url, readable_filename, content, groups):
+    if content:
+      return ingester.ingest_single_web_text(course_name, base_url, url, content, readable_filename, groups=groups)
+    elif readable_filename == '':
+      return ingester.bulk_ingest(course_name, s3_paths, base_url=base_url, url=url, groups=groups)
+    else:
+      return ingester.bulk_ingest(course_name,
+                                  s3_paths,
+                                  readable_filename=readable_filename,
+                                  base_url=base_url,
+                                  url=url,
+                                  groups=groups)
 
-    # First try
-    # Full Exception is unexpected, don't bother retrying
-    # If success_fail_dict has failures, then enter retry loop
-    success_fail_dict = {}
-    try:
-        success_fail_dict = run_ingest(course_name, s3_paths, base_url, url, readable_filename, content, doc_groups)
-    except Exception as e:
-        # Don't bother retrying
-        print("Exception in main ingest", e)
-        success_fail_dict = {'failure_ingest': str(e)}
-        handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, e)
-    
-    # Catch failed ingest that is not unexpected exception
-    if isinstance(success_fail_dict, str):
-        success_fail_dict = {'failure_ingest': success_fail_dict}
-    
-    # Retry failed ingests (but not unexpected exceptions)
-    if success_fail_dict.get('failure_ingest'):
-      success_fail_dict = retry_ingest(supabase_client, posthog, run_ingest, course_name, s3_paths, base_url, url, readable_filename, content, doc_groups)
-      if isinstance(success_fail_dict, str) or success_fail_dict.get('failure_ingest'):
-        error = str(success_fail_dict if isinstance(success_fail_dict, str) else success_fail_dict['failure_ingest'])
-        handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, error)
+  # First try
+  # Full Exception is unexpected, don't bother retrying
+  # If success_fail_dict has failures, then enter retry loop
+  success_fail_dict = {}
+  try:
+    success_fail_dict = run_ingest(course_name, s3_paths, base_url, url, readable_filename, content, doc_groups)
+  except Exception as e:
+    # Don't bother retrying
+    print("Exception in main ingest", e)
+    success_fail_dict = {'failure_ingest': str(e)}
+    handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, e)
 
-    # Cleanup: Remove from docs_in_progress table
-    try:
-        if base_url:
-            print('Removing URL-based document from in_progress')
-            supabase_client.table('documents_in_progress').delete()\
-                .eq('url', url)\
-                .eq('base_url', base_url)\
-                .execute()
-        else:
-            supabase_client.table('documents_in_progress').delete()\
-                .eq('course_name', course_name)\
-                .eq('s3_path', s3_paths)\
-                .eq('readable_filename', readable_filename)\
-                .execute()
-    except Exception as e:
-        print(f"Error cleaning up documents_in_progress: {e}")
-        sentry_sdk.capture_exception(e)
-        
-    if success_fail_dict.get('success_ingest'):
-      posthog.capture(
-          'distinct_id_of_the_user',
-          event='ingest_success',
-          properties={
-              'course_name': course_name,
-              's3_path': s3_paths,
-              's3_paths': s3_paths,
-              'url': url,
-              'base_url': base_url,
-              'readable_filename': readable_filename,
-              'content': content,
-              'doc_groups': doc_groups,
-          })
-        
-    
-    print(f"Final success_fail_dict: {success_fail_dict}")
-    sentry_sdk.flush(timeout=20)
-    return json.dumps(success_fail_dict)
+  # Catch failed ingest that is not unexpected exception
+  if isinstance(success_fail_dict, str):
+    success_fail_dict = {'failure_ingest': success_fail_dict}
+
+  # Retry failed ingests (but not unexpected exceptions)
+  if success_fail_dict.get('failure_ingest'):
+    success_fail_dict = retry_ingest(supabase_client, posthog, run_ingest, course_name, s3_paths, base_url, url,
+                                     readable_filename, content, doc_groups)
+    if isinstance(success_fail_dict, str) or success_fail_dict.get('failure_ingest'):
+      error = str(success_fail_dict if isinstance(success_fail_dict, str) else success_fail_dict['failure_ingest'])
+      handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, error)
+
+  # Cleanup: Remove from docs_in_progress table
+  try:
+    if base_url:
+      print('Removing URL-based document from in_progress')
+      supabase_client.table('documents_in_progress').delete()\
+          .eq('url', url)\
+          .eq('base_url', base_url)\
+          .execute()
+    else:
+      supabase_client.table('documents_in_progress').delete()\
+          .eq('course_name', course_name)\
+          .eq('s3_path', s3_paths)\
+          .eq('readable_filename', readable_filename)\
+          .execute()
+  except Exception as e:
+    print(f"Error cleaning up documents_in_progress: {e}")
+    sentry_sdk.capture_exception(e)
+
+  if success_fail_dict.get('success_ingest'):
+    posthog.capture('distinct_id_of_the_user',
+                    event='ingest_success',
+                    properties={
+                        'course_name': course_name,
+                        's3_path': s3_paths,
+                        's3_paths': s3_paths,
+                        'url': url,
+                        'base_url': base_url,
+                        'readable_filename': readable_filename,
+                        'content': content,
+                        'doc_groups': doc_groups,
+                    })
+
+  print(f"Final success_fail_dict: {success_fail_dict}")
+  sentry_sdk.flush(timeout=20)
+  return json.dumps(success_fail_dict)
+
 
 def handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, error):
-    document = {
-        "course_name": course_name,
-        "s3_path": s3_paths,
-        "readable_filename": readable_filename,
-        "url": url,
-        "base_url": base_url,
-        "error": str(error)
-    }
-    # Check if document already exists
-    existing = supabase_client.table('documents_failed')\
-        .select('*')\
-        .eq('course_name', course_name)\
-        .eq('s3_path', s3_paths)\
-        .eq('readable_filename', readable_filename)\
-        .eq('url', url)\
-        .eq('base_url', base_url)\
-        .execute()
-    
-    # Only insert if no matching document exists
-    if not existing.data:
-        supabase_client.table('documents_failed').insert(document).execute()
+  document = {
+      "course_name": course_name,
+      "s3_path": s3_paths,
+      "readable_filename": readable_filename,
+      "url": url,
+      "base_url": base_url,
+      "error": str(error)
+  }
+  # Check if document already exists
+  existing = supabase_client.table('documents_failed')\
+      .select('*')\
+      .eq('course_name', course_name)\
+      .eq('s3_path', s3_paths)\
+      .eq('readable_filename', readable_filename)\
+      .eq('url', url)\
+      .eq('base_url', base_url)\
+      .execute()
 
-    posthog.capture(
-                'distinct_id_of_the_user',
-                event='ingest_failure',
-                properties={
-                    'course_name':
-                        course_name,
-                    's3_path':
-                        s3_paths,
-                    'url':
-                        url,
-                    'base_url': base_url,
-                    'readable_filename': readable_filename,
-                    'error': str(error)
-                })
+  # Only insert if no matching document exists
+  if not existing.data:
+    supabase_client.table('documents_failed').insert(document).execute()
 
-def retry_ingest(supabase_client, posthog, run_ingest, course_name, s3_paths, base_url, url, readable_filename, content, doc_groups):
-    num_retries = 3
-    last_error = None
+  posthog.capture('distinct_id_of_the_user',
+                  event='ingest_failure',
+                  properties={
+                      'course_name': course_name,
+                      's3_path': s3_paths,
+                      'url': url,
+                      'base_url': base_url,
+                      'readable_filename': readable_filename,
+                      'error': str(error)
+                  })
 
-    for retry_num in range(1, num_retries):
-        try:
-            success_fail_dict = run_ingest(course_name, s3_paths, base_url, url, readable_filename, content, doc_groups)
-            if isinstance(success_fail_dict, str) or success_fail_dict.get('failure_ingest'):
-                print(f"Retry attempt {retry_num}. File: {success_fail_dict}")
-                last_error = success_fail_dict
-                time.sleep(13 * retry_num)
-            else:
-                return success_fail_dict
-        except Exception as e:
-            print(f"Exception in ingest retry loop {retry_num}", e)
-            last_error = {'failure_ingest': str(e)}
-            handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, e)
-            time.sleep(13 * retry_num)
 
-    return last_error or {'failure_ingest': 'All retries failed'}
+def retry_ingest(supabase_client, posthog, run_ingest, course_name, s3_paths, base_url, url, readable_filename, content,
+                 doc_groups):
+  num_retries = 3
+  last_error = None
+
+  for retry_num in range(1, num_retries):
+    try:
+      success_fail_dict = run_ingest(course_name, s3_paths, base_url, url, readable_filename, content, doc_groups)
+      if isinstance(success_fail_dict, str) or success_fail_dict.get('failure_ingest'):
+        print(f"Retry attempt {retry_num}. File: {success_fail_dict}")
+        last_error = success_fail_dict
+        time.sleep(13 * retry_num)
+      else:
+        return success_fail_dict
+    except Exception as e:
+      print(f"Exception in ingest retry loop {retry_num}", e)
+      last_error = {'failure_ingest': str(e)}
+      handle_ingest_failure(supabase_client, posthog, course_name, s3_paths, readable_filename, url, base_url, e)
+      time.sleep(13 * retry_num)
+
+  return last_error or {'failure_ingest': 'All retries failed'}
+
 
 class Ingest():
 
-  def __init__(self, qdrant_client, vectorstore, s3_client, supabase_client, posthog):
+  def __init__(self, qdrant_client, cropwizard_qdrant_client, vectorstore, s3_client, supabase_client, posthog):
     self.qdrant_client = qdrant_client
+    self.cropwizard_qdrant_client = cropwizard_qdrant_client
     self.vectorstore = vectorstore
     self.s3_client = s3_client
     self.supabase_client = supabase_client
@@ -342,6 +358,7 @@ class Ingest():
     -> Dict[str, str | Dict[str, str]]
     """
     print('s3 path from bulk ingest', s3_paths)
+
     def _ingest_single(ingest_method: Callable, s3_path, *args, **kwargs):
       """Handle running an arbitrary ingest function for an individual file."""
       # RUN INGEST METHOD
@@ -1186,12 +1203,16 @@ class Ingest():
         context.metadata['chunk_index'] = i
         context.metadata['doc_groups'] = kwargs.get('groups', [])
 
+      openai_embeddings_key = os.getenv('VLADS_OPENAI_KEY')
+      if metadatas[0].get('course_name') == 'cropwizard-1.5':
+        openai_embeddings_key = os.getenv('CROPWIZARD_OPENAI_KEY')
+
       print("Starting to call embeddings API")
       embeddings_start_time = time.monotonic()
       oai = OpenAIAPIProcessor(
           input_prompts_list=input_texts,
           request_url='https://api.openai.com/v1/embeddings',
-          api_key=os.getenv('VLADS_OPENAI_KEY'),
+          api_key=openai_embeddings_key,
           # request_url='https://uiuc-chat-canada-east.openai.azure.com/openai/deployments/text-embedding-ada-002/embeddings?api-version=2023-05-15',
           # api_key=os.getenv('AZURE_OPENAI_KEY'),
           max_requests_per_minute=10_000,
@@ -1215,10 +1236,19 @@ class Ingest():
             PointStruct(id=str(uuid.uuid4()), vector=embeddings_dict[context.page_content], payload=upload_metadata))
 
       try:
-        self.qdrant_client.upsert(
-            collection_name=os.environ['QDRANT_COLLECTION_NAME'],  # type: ignore
-            points=vectors,  # type: ignore
-        )
+        # ----------------------------
+        # SPECIAL CASE FOR CROPWIZARD INGEST
+        # ----------------------------
+        if metadatas[0].get('course_name') == 'cropwizard-1.5':
+          self.cropwizard_qdrant_client.upsert(
+              collection_name='cropwizard',
+              points=vectors,
+          )
+        else:
+          self.qdrant_client.upsert(
+              collection_name=os.environ['QDRANT_COLLECTION_NAME'],
+              points=vectors,
+          )
       except Exception as e:
         logging.error("Error in QDRANT upload: ", exc_info=True)
         err = f"Error in QDRANT upload: {e}"
@@ -1421,15 +1451,26 @@ class Ingest():
         # docs for nested keys: https://qdrant.tech/documentation/concepts/filtering/#nested-key
         # Qdrant "points" look like this: Record(id='000295ca-bd28-ac4a-6f8d-c245f7377f90', payload={'metadata': {'course_name': 'zotero-extreme', 'pagenumber_or_timestamp': 15, 'readable_filename': 'Dunlosky et al. - 2013 - Improving Students’ Learning With Effective Learni.pdf', 's3_path': 'courses/zotero-extreme/Dunlosky et al. - 2013 - Improving Students’ Learning With Effective Learni.pdf'}, 'page_content': '18  \nDunlosky et al.\n3.3 Effects in representative educational contexts. Sev-\neral of the large summarization-training studies have been \nconducted in regular classrooms, indicating the feasibility of \ndoing so. For example, the study by A. King (1992) took place \nin the context of a remedial study-skills course for undergrad-\nuates, and the study by Rinehart et al. (1986) took place in \nsixth-grade classrooms, with the instruction led by students \nregular teachers. In these and other cases, students benefited \nfrom the classroom training. We suspect it may actually be \nmore feasible to conduct these kinds of training  ...
         try:
-          self.qdrant_client.delete(
-              collection_name=os.environ['QDRANT_COLLECTION_NAME'],
-              points_selector=models.Filter(must=[
-                  models.FieldCondition(
-                      key="s3_path",
-                      match=models.MatchValue(value=s3_path),
-                  ),
-              ]),
-          )
+          if course_name == 'cropwizard-1.5':
+            self.cropwizard_qdrant_client.delete(
+                collection_name='cropwizard',
+                points_selector=models.Filter(must=[
+                    models.FieldCondition(
+                        key="s3_path",
+                        match=models.MatchValue(value=s3_path),
+                    ),
+                ]),
+            )
+          else:
+            self.qdrant_client.delete(
+                collection_name=os.environ['QDRANT_COLLECTION_NAME'],
+                points_selector=models.Filter(must=[
+                    models.FieldCondition(
+                        key="s3_path",
+                        match=models.MatchValue(value=s3_path),
+                    ),
+                ]),
+            )
         except Exception as e:
           if "timed out" in str(e):
             # Timed out is fine. Still deletes.

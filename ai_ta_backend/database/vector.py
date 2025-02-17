@@ -32,6 +32,16 @@ class VectorDatabase():
                                              https=True,
                                              api_key=os.environ['VYRIAD_QDRANT_API_KEY'])
 
+    try:
+      # No major uptime guarantees
+      self.cropwizard_qdrant_client = QdrantClient(url="https://cropwizard-qdrant.ncsa.ai",
+                                                   port=443,
+                                                   https=True,
+                                                   api_key=os.environ['QDRANT_API_KEY'])
+    except Exception as e:
+      print(f"Error in cropwizard_qdrant_client: {e}")
+      self.cropwizard_qdrant_client = None
+
     self.vectorstore = Qdrant(client=self.qdrant_client,
                               collection_name=os.environ['QDRANT_COLLECTION_NAME'],
                               embeddings=OpenAIEmbeddings(openai_api_key=os.environ['VLADS_OPENAI_KEY']))
@@ -51,6 +61,23 @@ class VectorDatabase():
         # In a system with high disk latency, the re-scoring step may become a bottleneck: https://qdrant.tech/documentation/guides/quantization/
         search_params=models.SearchParams(quantization=models.QuantizationSearchParams(rescore=False)))
     # print(f"Search results: {search_results}")
+    return search_results
+
+  def cropwizard_vector_search(self, search_query, course_name, doc_groups: List[str], user_query_embedding, top_n,
+                               disabled_doc_groups: List[str], public_doc_groups: List[dict]):
+    """
+    Search the vector database for a given query.
+    """
+    top_n = 120
+
+    search_results = self.cropwizard_qdrant_client.search(
+        collection_name='cropwizard',
+        query_filter=self._create_search_filter(course_name, doc_groups, disabled_doc_groups, public_doc_groups),
+        with_vectors=False,
+        query_vector=user_query_embedding,
+        limit=top_n,  # Return n closest points
+    )
+
     return search_results
 
   def vyriad_vector_search(self, search_query, course_name, doc_groups: List[str], user_query_embedding, top_n,
